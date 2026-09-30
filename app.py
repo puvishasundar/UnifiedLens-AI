@@ -1822,13 +1822,10 @@ elif selected == "Analyzer":
                     pb.progress((i + 1) / len(steps)); time.sleep(0)
                 ph.empty(); pb.empty()
 
-                # Combined pipeline: always run Text Analysis; if the pasted
-                # text contains one or more URLs, also run the FULL URL
-                # Analysis pipeline on each one (website content extraction,
-                # threat score, scam explanation, suspicious indicators,
-                # extracted website text) -- automatically, no module switch.
-                combined = analyse_text_full(text_input)
-                result   = combined["text_result"]
+                # Text Message flow: the whole input (including any URL) is
+                # analysed as plain text by the text model only. No URL
+                # extraction or URL Scanner call happens here.
+                result = analyse_text(text_input, detect_urls=False)
                 log_scan(result, "AI Analyzer")
 
                 # ── Language detection badge (safe HTML only) ────────────────
@@ -1861,14 +1858,6 @@ elif selected == "Analyzer":
                     }))
                 
                 render_full_result(result)
-
-                # ── Auto-triggered URL Analysis for every link found in the text ──
-                for url_res in combined["url_results"]:
-                    st.write("")
-                    H('<div class="cyber-divider"></div>')
-                    section_header(f"🔗 URL Analysis — {url_res.get('url')}", "🌐")
-                    log_scan(url_res, "URL Scanner (auto, from Text)")
-                    render_full_result(url_res)
 
     with tab_image:
         st.write("")

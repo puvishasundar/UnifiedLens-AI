@@ -76,7 +76,7 @@ def get_recommendations(level: str) -> list:
     return _RECS.get(level, _RECS['SAFE'])
 
 
-def analyse_text(text: str) -> dict:
+def analyse_text(text: str, detect_urls: bool = True) -> dict:
     if not text or not text.strip():
         return {'error': 'No text provided'}
 
@@ -119,6 +119,10 @@ def analyse_text(text: str) -> dict:
     # text (links are never translated, and translators sometimes mangle
     # or drop them). ────────────────────────────────────────────────────────
     signals         = _extract_contact_signals(original_text, analysis_text)
+    if not detect_urls:
+        # Text Message flow: URLs stay as plain text for the text model only;
+        # no URL indicators / URL-detected wording is produced.
+        signals['urls'] = []
     text_indicators = _build_text_indicators(signals, kw_result['found'], analysis_text)
 
     indicator_bonus = 0   # display-only default — keeps scoring untouched
