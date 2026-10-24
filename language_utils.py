@@ -1,4 +1,4 @@
-# language_utils.py — CyberLens AI
+# language_utils.py — UnifiedLens AI
 # Multilingual support: auto-detect language + translate to English before analysis
 #
 # Supported languages:
@@ -11,9 +11,12 @@
 #   3. deep-translator — fallback free translation library
 #
 # If ALL translation backends fail, the original text is returned unchanged
-# so the rest of the CyberLens pipeline still works.
+# so the rest of the UnifiedLens pipeline still works.
 
 import re
+import time
+import asyncio
+import inspect
 import unicodedata
 import streamlit as st
 
@@ -107,24 +110,32 @@ def detect_language(text: str) -> dict:
 
     # 2️⃣  langdetect library
     try:
-        from langdetect import detect, detect_langs
+        from langdetect import DetectorFactory, detect_langs
+        DetectorFactory.seed = 0          # deterministic: same text → same answer
         langs = detect_langs(text)
         if langs:
-            top  = langs[0]
-            code = top.lang
-            conf = round(float(top.prob), 3)
-            # Map some langdetect codes to ours (e.g. 'zh-cn' → unsupported)
-            is_sup = code in SUPPORTED_LANG_CODES
-            meta   = SUPPORTED_LANGUAGES.get(code, {})
-            return {
-                'lang_code':   code,
-                'lang_name':   meta.get('name', code.upper()),
-                'native_name': meta.get('native', ''),
-                'flag':        meta.get('flag', '🏳️'),
-                'confidence':  conf,
-                'is_supported':is_sup,
-                'method':      'langdetect',
-            }
+            top = langs[0]
+            # Short English/Spanish messages are often mislabelled as fr/it/nl/
+            # ro/tl/so… Translating those with a wrong source language mangles
+            # the text. For Latin-script text, prefer the best-scoring *supported*
+            # candidate (en/es); if none is plausible, fall through to the
+            # English/Spanish heuristic below.
+            if top.lang not in SUPPORTED_LANG_CODES and _is_mostly_latin(text):
+                top = next((l for l in langs if l.lang in ('en', 'es')), None)
+            if top is not None:
+                code   = top.lang
+                conf   = round(float(top.prob), 3)
+                is_sup = code in SUPPORTED_LANG_CODES
+                meta   = SUPPORTED_LANGUAGES.get(code, {})
+                return {
+                    'lang_code':   code,
+                    'lang_name':   meta.get('name', code.upper()),
+                    'native_name': meta.get('native', ''),
+                    'flag':        meta.get('flag', '🏳️'),
+                    'confidence':  conf,
+                    'is_supported':is_sup,
+                    'method':      'langdetect',
+                }
     except Exception:
         pass
 
@@ -155,8 +166,170 @@ def detect_language(text: str) -> dict:
 
 
 # ─── Translation ───────────────────────────────────────────────────────────────
+# Root-cause notes (why non-English scams were scored as "safe"):
+#   • Only the FIRST 500 chars could be sent to the MyMemory fallback (hard
+#     limit) and googletrans 4.0.0-rc1 is unmaintained/broken, so for most real
+#     messages BOTH backends failed.
+#   • On failure the ORIGINAL (e.g. Tamil) text was silently handed to the
+#     English-only ML model + keyword scorer → no keywords → "SAFE/LOW".
+#   • @st.cache_data then cached that failed result, so retries kept failing.
+# Fix: Google (deep-translator) as primary, text split into safe chunks,
+# per-chunk fallbacks, output validation, and failures are never cached.
+
+_GOOGLE_CHUNK   = 4500   # Google web limit is 5000 chars/request
+_MYMEMORY_CHUNK = 450    # MyMemory hard limit is 500 chars/request
+
+_MYMEMORY_CODES = {
+    'ta': 'ta-IN', 'te': 'te-IN', 'ml': 'ml-IN',
+    'kn': 'kn-IN', 'hi': 'hi-IN', 'es': 'es-ES',
+}
+_SEGMENT_RE = re.compile(r'[^\n.!?।॥]*[\n.!?।॥]+|[^\n.!?।॥]+')
+
+
+def _split_chunks(text: str, limit: int) -> list[str]:
+    """Split *text* into chunks <= limit chars at sentence/line boundaries."""
+    pieces = []
+    for seg in _SEGMENT_RE.findall(text):
+        while len(seg) > limit:                     # one very long sentence
+            cut = seg.rfind(' ', 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            pieces.append(seg[:cut])
+            seg = seg[cut:]
+        if seg:
+            pieces.append(seg)
+    chunks, cur = [], ''
+    for p in pieces:
+        if cur and len(cur) + len(p) > limit:
+            chunks.append(cur)
+            cur = ''
+        cur += p
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
+
+def _indic_ratio(s: str) -> float:
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return 0.0
+    indic = sum(1 for c in letters
+                if any(lo <= ord(c) <= hi for lo, hi in _SCRIPT_RANGES.values()))
+    return indic / len(letters)
+
+
+def _valid_translation(original: str, out: str, src_lang: str) -> bool:
+    """Reject empty / untranslated output (some backends echo the input)."""
+    if not out or not out.strip():
+        return False
+    if src_lang in _SCRIPT_RANGES:
+        return _indic_ratio(out) < 0.5
+    if src_lang == 'es' and len(original.split()) >= 3:
+        return out.strip().lower() != original.strip().lower()
+    return True
+
+
+def _run_maybe_async(value):
+    """googletrans >= 4.0.1 is async; rc1 is sync. Support both."""
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        return asyncio.run(value)
+    except RuntimeError:                           # a loop is already running
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(value)
+        finally:
+            loop.close()
+
+
+def _tr_google(chunk: str, src: str) -> str:
+    from deep_translator import GoogleTranslator
+    return GoogleTranslator(source=src, target='en').translate(chunk)
+
+
+def _tr_googletrans(chunk: str, src: str) -> str:
+    from googletrans import Translator
+    res = _run_maybe_async(Translator().translate(chunk, src=src, dest='en'))
+    return res.text
+
+
+def _tr_mymemory(chunk: str, src: str) -> str:
+    from deep_translator import MyMemoryTranslator
+    return MyMemoryTranslator(source=_MYMEMORY_CODES.get(src, src),
+                              target='en-GB').translate(chunk)
+
+
+# (name, function, chunk size) — tried in this order for every chunk
+_BACKENDS = [
+    ('deep_translator', _tr_google,      _GOOGLE_CHUNK),
+    ('googletrans',     _tr_googletrans, _GOOGLE_CHUNK),
+    ('mymemory',        _tr_mymemory,    _MYMEMORY_CHUNK),
+]
+
+
+def _translate_chunk(chunk: str, src: str, backend, dead: set, errors: list):
+    name, fn, limit = backend
+    pieces = [chunk] if len(chunk) <= limit else _split_chunks(chunk, limit)
+    outs = []
+    for piece in pieces:
+        out = None
+        for attempt in range(2):                   # one retry for flaky calls
+            try:
+                out = fn(piece, src)
+                if _valid_translation(piece, out, src):
+                    break
+                out = None
+            except Exception as e:                 # network / rate-limit / lib error
+                errors.append(f"{name}: {e}")
+                out = None
+            time.sleep(0.4)
+        if out is None:
+            return None
+        outs.append(out.strip())
+    return ' '.join(outs)
+
+
+def _translate_full(text: str, src_lang: str) -> tuple[str, str, list]:
+    """Translate the COMPLETE text. Returns (english, method, errors).
+    english is '' if any part could not be translated by any backend."""
+    errors, dead, used = [], set(), []
+    out_parts = []
+    for chunk in _split_chunks(text, _GOOGLE_CHUNK):
+        if not re.search(r'\w', chunk):           # punctuation/whitespace only
+            out_parts.append((chunk.strip(), chunk))
+            continue
+        result = None
+        for backend in _BACKENDS:
+            if backend[0] in dead:
+                continue
+            result = _translate_chunk(chunk, src_lang, backend, dead, errors)
+            if result:
+                if backend[0] not in used:
+                    used.append(backend[0])
+                break
+            if backend[0] not in used:             # never worked → skip it from now on
+                dead.add(backend[0])
+        if not result:
+            return '', '', errors
+        out_parts.append((result, chunk))
+
+    joined = ''
+    for out, chunk in out_parts:
+        joined += out + ('\n' if chunk.endswith('\n') else ' ')
+    return joined.strip(), '+'.join(used), errors
+
+
+@st.cache_data(max_entries=256, show_spinner=False)
+def _translate_cached(text: str, src_lang: str) -> tuple:
+    """Cached ONLY on success — raising keeps failures out of the cache."""
+    english, method, errors = _translate_full(text, src_lang)
+    if not english:
+        raise RuntimeError('; '.join(errors[-3:]) or 'no backend returned a translation')
+    return english, method
+
+
 def translate_to_english(text: str, src_lang: str) -> dict:
-    """Translate supported non-English text to English."""
+    """Translate supported non-English text to English (complete text)."""
 
     if src_lang == "en":
         return {
@@ -166,72 +339,24 @@ def translate_to_english(text: str, src_lang: str) -> dict:
             "error": None,
         }
 
-    # Try googletrans
     try:
-        from googletrans import Translator
-
-        translator = Translator()
-        result = translator.translate(
-            text,
-            src=src_lang,
-            dest="en"
-        )
-
-        translated = result.text
-
-        if translated and translated.strip():
-            return {
-                "translated_text": translated,
-                "success": True,
-                "method": "googletrans",
-                "error": None,
-            }
-
-    except Exception as e:
-        google_error = str(e)
-
-    # Try deep-translator
-    try:
-        from deep_translator import MyMemoryTranslator
-
-        MYMEMORY_CODES = {
-            'ta': 'ta-IN',   # Tamil
-            'te': 'te-IN',   # Telugu
-            'ml': 'ml-IN',   # Malayalam
-            'kn': 'kn-IN',   # Kannada
-            'hi': 'hi-IN',   # Hindi
-            'es': 'es-ES',   # Spanish
+        english, method = _translate_cached(text, src_lang)
+        return {
+            "translated_text": english,
+            "success": True,
+            "method": method,
+            "error": None,
         }
-
-        source_code = MYMEMORY_CODES.get(src_lang, src_lang)
-
-        translated = MyMemoryTranslator(
-            source=source_code,
-            target='en-GB'
-        ).translate(text)
-
-        if translated and translated.strip():
-            return {
-                "translated_text": translated,
-                "success": True,
-                "method": "deep_translator",
-                "error": None,
-            }
-
     except Exception as e:
-        deep_error = str(e)
-
-    # Both failed
-    return {
-        "translated_text": text,
-        "success": False,
-        "method": "passthrough",
-        "error": "Translation services are temporarily unavailable.",
-    }
+        return {
+            "translated_text": text,
+            "success": False,
+            "method": "passthrough",
+            "error": f"Translation services are temporarily unavailable. ({e})",
+        }
 
 # ─── Combined: Detect + Translate ─────────────────────────────────────────────
 
-@st.cache_data(max_entries=256)
 def detect_and_translate(text: str) -> dict:
     """
     Full pipeline: detect language → translate to English if needed.
