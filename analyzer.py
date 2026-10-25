@@ -1,4 +1,4 @@
-# analyzer.py — CyberLens AI
+# analyzer.py — UnifiedLens AI
 # High-level analysis wrappers used by app.py
 
 import io
@@ -19,7 +19,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Uses the root logging config set up in app.py (logging.basicConfig). If this
 # module is ever imported standalone (e.g. in a test script), it still logs to
 # the console at INFO level by default.
-logger = logging.getLogger("cyberlens.analyzer")
+logger = logging.getLogger("Unifiedlens.analyzer")
 
 _WIN_TESS = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 if os.name == 'nt':
@@ -38,6 +38,11 @@ from language_utils import detect_and_translate, tag_segments
 from trusted_companies import (
     match_trusted_domain, detect_brand_impersonation, company_name_matches_brand,
 )
+from url_security import (
+    BlockedTargetError, safe_get, scan_gate, make_route_guard,
+    limit_browser_concurrency, MAX_RESPONSE_BYTES,
+)
+from html import escape as _escape_html
 
 _RECS = {
     'CRITICAL': [
@@ -479,7 +484,7 @@ def analyse_text_full(text: str, max_urls: int = 3) -> dict:
         try:
             r = analyse_url_full(u)
         except Exception as e:
-            r = {'error': f'URL analysis failed for {u}: {e}'}
+            r = {'error': _escape_html(f'URL analysis failed for {u}: {e}')}
         r = dict(r)
         r['url'] = r.get('url', u)
         r['scan_type'] = 'URL Scanner'   # so the UI renders the full URL card
@@ -495,9 +500,6 @@ def analyse_text_full(text: str, max_urls: int = 3) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ⛔ STOP — EVERYTHING BELOW THIS POINT IS UNCHANGED.
-# Keep YOUR existing analyzer.py exactly as it is, starting from the line:
-#
 #     SCAM_CONTENT_PHRASES = [
 #
 # all the way to the end of the file (SCAM_CONTENT_PHRASES, _BOILERPLATE_TAGS,
@@ -620,6 +622,7 @@ def _extract_visible_text(html_content: str) -> str:
     return text
 
 
+@limit_browser_concurrency
 def fetch_via_playwright(url: str, timeout_ms: int = 15000) -> tuple:
     """
     Render a page with a real headless browser for JS-heavy / bot-gated sites.
@@ -650,7 +653,12 @@ def fetch_via_playwright(url: str, timeout_ms: int = 15000) -> tuple:
                 extra_http_headers={
                     'Accept-Language': 'en-US,en;q=0.9',
                 },
+                accept_downloads=False,      # SECURITY: never save files from a scanned site
+                service_workers='block',     # SECURITY: SW traffic would bypass the route guard
             )
+            context.set_default_timeout(timeout_ms)
+            # SECURITY: every request (page, subresources, redirects) must hit a public http(s) host
+            context.route('**/*', make_route_guard())
             page = context.new_page()
 
             status = None
@@ -670,8 +678,15 @@ def fetch_via_playwright(url: str, timeout_ms: int = 15000) -> tuple:
                 pass
             page.wait_for_timeout(1200)  # let hydration/lazy content paint
 
-            html = page.content()
-            browser.close()
+            try:
+                html = page.content()
+                final_url = page.url
+            finally:
+                browser.close()      # SECURITY: never leak a Chromium process on error
+
+            if not final_url.lower().startswith(('http://', 'https://')):
+                return None, status, "Navigation was blocked or failed"
+            html = html[:MAX_RESPONSE_BYTES]   # SECURITY: bound memory used by the DOM dump
 
             if not html or len(html) < 50:
                 return None, status, "Playwright returned an empty page"
@@ -741,7 +756,9 @@ def analyse_webpage_content(url: str, timeout: int = 12) -> dict:
     js_rendering_used = False
 
     try:
-        resp = requests.get(fetch_url, headers=headers, timeout=timeout, allow_redirects=True, verify=False)
+        # SECURITY: SSRF-safe fetch — validates the target and every redirect hop,
+        # caps the body at MAX_RESPONSE_BYTES and the whole fetch at a wall-clock limit.
+        resp = safe_get(fetch_url, headers=headers, timeout=timeout)
         status_code = resp.status_code
         result['debug_logs']['http_status'] = status_code
         result['debug_logs']['response_size'] = len(resp.content)
@@ -780,6 +797,14 @@ def analyse_webpage_content(url: str, timeout: int = 12) -> dict:
             resp.raise_for_status()
             html_content = resp.text
 
+    except BlockedTargetError as e:
+        # SECURITY: private/loopback/link-local target or redirect — never contacted.
+        result['error'] = str(e)
+        result['blocked_reason'] = str(e)
+        logger.warning("[URL Scanner] SSRF protection blocked %s: %s", fetch_url, e)
+    except requests.exceptions.TooManyRedirects:
+        result['error'] = "The website redirected too many times."
+        logger.warning("[URL Scanner] Too many redirects for %s", fetch_url)
     except requests.exceptions.Timeout:
         result['error'] = "The website took too long to respond (timeout)."
         logger.warning("[URL Scanner] Timeout fetching %s", fetch_url, exc_info=True)
@@ -943,6 +968,7 @@ def analyse_webpage_content(url: str, timeout: int = 12) -> dict:
 
     return result
 
+@scan_gate   # SECURITY: rate limit + connect-time SSRF guard for every URL scan
 def analyse_url_full(url: str) -> dict:
     """Wrap utils.analyse_url with a friendly result envelope."""
     if not url or not url.strip():
@@ -978,6 +1004,9 @@ def analyse_url_full(url: str) -> dict:
         indicators.append('Masked URL (using known link shortener)')
 
     content_result = analyse_webpage_content(url)
+    blocked_reason = content_result.get('blocked_reason')
+    if blocked_reason:
+        indicators.append('Page not fetched: address is private/internal (SSRF protection)')
     scam_phrases    = content_result.get('suspicious_phrases', [])
     if scam_phrases:
         indicators.append(f"Scam phrases found on page: {', '.join(scam_phrases[:4])}")
@@ -1121,6 +1150,8 @@ def analyse_url_full(url: str) -> dict:
         explanation_bullets.append(
             f"⚠ Mimics {impersonation_brand.title()} branding but is not an official {impersonation_brand.title()} domain"
         )
+    if blocked_reason:
+        explanation_bullets.append("ℹ Page was not opened: the address is private/internal, so it was not contacted")
     if shortener_warning_detected:
         explanation_bullets.append("✓ URL officially suspended/blocked by the provider for abuse")
     if base['suspicious_kw'] or scam_phrases:
@@ -1535,7 +1566,7 @@ def analyse_qr(image_bytes: bytes) -> dict:
 # --psm 6 = "assume a single uniform block of text" — the best default for
 #           screenshots, phone-camera photos of a message/document, and
 #           single-column scans, which is the overwhelming majority of
-#           CyberLens input. This is the #1 fix for the "words merged
+#           UnifiedLens input. This is the #1 fix for the "words merged
 #           together" symptom: the default PSM (3) does full page-layout
 #           analysis and on a simple block of text it can mis-detect
 #           column/paragraph boundaries and run words together, whereas

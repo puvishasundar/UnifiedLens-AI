@@ -691,7 +691,7 @@ def render_full_result(result: dict) -> None:
     score  = round(result.get("risk_score", 0))
     conf   = round(result.get("confidence", 0))
     emoji  = result.get("risk_emoji", "🟢")
-    verdict_text = result.get("verdict", "No verdict available.")
+    verdict_text = _html.escape(str(result.get("verdict", "No verdict available.")))
     recs   = result.get("recommendations", [])
     kws    = result.get("suspicious_kws", [])          # full backend list (untouched)
     kws    = select_display_indicators(kws, result)     # display-only: strongest few
@@ -712,7 +712,7 @@ def render_full_result(result: dict) -> None:
 
     # Build HTML fragments used inside the big f-string below
     if kws:
-        kw_chips_html = "".join(f'<span class="kw-chip">{kw}</span>' for kw in kws)
+        kw_chips_html = "".join(f'<span class="kw-chip">{_html.escape(str(kw))}</span>' for kw in kws)
     else:
         kw_chips_html = '<span style="color:#5a7a9a;font-size:0.82rem;font-family:monospace">Nothing notable detected.</span>'
 
@@ -751,7 +751,7 @@ def render_full_result(result: dict) -> None:
         url_rows = "".join(
             f'<div class="data-row"><span class="dr-icon">{icon}</span>'
             f'<span class="dr-label">{label}</span>'
-            f'<span class="dr-val">{val}</span></div>'
+            f'<span class="dr-val">{_html.escape(str(val))}</span></div>'
             for label, (icon, val) in url_detail_items.items()
         )
         # Also show URL flags if any
@@ -760,7 +760,7 @@ def render_full_result(result: dict) -> None:
             url_rows += "".join(
                 f'<div class="data-row"><span class="dr-icon">🔍</span>'
                 f'<span class="dr-label">Verification Status</span>'
-                f'<span class="dr-val" style="color:#f97316">{f}</span></div>'
+                f'<span class="dr-val" style="color:#f97316">{_html.escape(str(f))}</span></div>'
                 for f in url_flags
             )
         url_details_html = (
@@ -1084,7 +1084,8 @@ def render_threat_popup(result: dict, url_val: str) -> None:
                          'CyberLens AI for your protection.</div>') if blocked else ""
 
     _uid = _hashlib.md5(f"{open_target}|{level}|{score}".encode("utf-8")).hexdigest()[:10]
-    _open_target_js = json.dumps(open_target)
+    # SECURITY: json.dumps() does not escape '<' — neutralise '</script>' break-outs
+    _open_target_js = json.dumps(open_target).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     _shake_class_js = json.dumps(cfg["shake"])
     _blocked_js      = "true" if blocked else "false"
 
@@ -1898,7 +1899,7 @@ elif selected == "Analyzer":
                         result = {"error": f"⚠️ OCR failed: {err_msg}"}
                 if "extracted_text" in result:
                     section_header("Extracted Text", "📄")
-                    H(f'<div class="text-preview">{result["extracted_text"][:600]}</div>')
+                    H(f'<div class="text-preview">{_html.escape(result["extracted_text"][:600])}</div>')
                     H(f'<div style="font-size:0.75rem;color:var(--text-dim);margin-top:4px;font-family:var(--font-mono)">'
                       f'{result["word_count"]} words · {result["char_count"]} chars</div>')
             log_scan(result, "OCR Scanner")
@@ -1981,7 +1982,7 @@ elif selected == "URL Scanner":
         label_visibility="collapsed",
     )
     if url_val:
-        H(f'<div class="url-display">{url_val}</div>')
+        H(f'<div class="url-display">{_html.escape(url_val)}</div>')
 
     st.write("")
     H('<div class="cta-btn">')
@@ -2070,7 +2071,7 @@ elif selected == "QR Scanner":
                 result = analyse_qr(uploaded.read())
             if "qr_data" in result:
                 section_header("Decoded Content", "🔓")
-                H(f'<div class="url-display">{result["qr_data"]}</div>')
+                H(f'<div class="url-display">{_html.escape(str(result["qr_data"]))}</div>')
                 _qr_type_meta = {
                     "URL":   ("🔗", "URL — routed through the URL Scanner pipeline"),
                     "EMAIL": ("📧", "Email address — routed through Text Scam Detection"),
