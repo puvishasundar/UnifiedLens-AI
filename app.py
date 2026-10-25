@@ -758,8 +758,8 @@ def render_full_result(result: dict) -> None:
         url_flags = result.get("flags", [])
         if url_flags:
             url_rows += "".join(
-                f'<div class="data-row"><span class="dr-icon">🚩</span>'
-                f'<span class="dr-label">Flag</span>'
+                f'<div class="data-row"><span class="dr-icon">🔍</span>'
+                f'<span class="dr-label">Verification Status</span>'
                 f'<span class="dr-val" style="color:#f97316">{f}</span></div>'
                 for f in url_flags
             )
@@ -1822,10 +1822,11 @@ elif selected == "Analyzer":
                     pb.progress((i + 1) / len(steps)); time.sleep(0)
                 ph.empty(); pb.empty()
 
-                # Text Message flow: the whole input (including any URL) is
-                # analysed as plain text by the text model only. No URL
-                # extraction or URL Scanner call happens here.
-                result = analyse_text(text_input, detect_urls=False)
+                # URLs in the pasted text are detected and analysed alongside
+                # the text: analyse_text_full() runs the text analysis plus a
+                # full URL scan on each embedded link.
+                _full  = analyse_text_full(text_input)
+                result = _full['text_result']
                 log_scan(result, "AI Analyzer")
 
                 # ── Language detection badge (safe HTML only) ────────────────
@@ -1858,6 +1859,12 @@ elif selected == "Analyzer":
                     }))
                 
                 render_full_result(result)
+
+                # Full URL analysis for each link found in the pasted text
+                for _url_res in _full.get('url_results', []):
+                    st.write("")
+                    section_header(f"Link Analysis: {_html.escape(str(_url_res.get('url', '')))}", "🔗")
+                    render_full_result(_url_res)
 
     with tab_image:
         st.write("")
